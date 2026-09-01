@@ -1,42 +1,81 @@
-![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
+![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg)
 
-# Tiny Tapeout Verilog Project Template
+# Laser Gyro Lock-in Readout Core
 
-- [Read the documentation for project](docs/info.md)
+Open-loop lock-in demodulator for the digital readout electronics of a
+single-axis laser gyroscope (fiber-optic interferometer), targeting the
+Tiny Tapeout shuttle **TTIHP26b** (IHP SG13G2, 130 nm).
+
+Author: Marco Flückiger
+
+## How it works
+
+```
+1-bit ΔΣ bitstream (photodiode frontend)
+        │
+        ▼   ui_in[0]          ui_in[1] = Enable
+┌───────────────────────────────────────────────┐
+│              tt_um_gyro_lockin                │
+│                                               │
+│  mod_ref_gen ──► lockin_demod ──► spi_slave   │
+│  (square-wave     (correlator +   (register   │
+│   reference)       accumulator)    interface) │
+│       │                                  │    │
+│       ▼ uo_out[0] (to piezo              ▼    │
+│          phase modulator)           SPI SCK/  │
+│       uo_out[1] window_done         MOSI/MISO/│
+│       uo_out[2] heartbeat LED       CS_N      │
+└───────────────────────────────────────────────┘
+```
+
+A configurable square-wave generator (`mod_ref_gen`) produces the phase
+modulation reference that drives an external fiber-optic phase modulator
+(e.g. a low-cost piezo fiber stretcher) via `uo_out[0]`. The returning
+interferometer signal is digitized by an external 1-bit delta-sigma ADC
+and fed into `ui_in[0]`. The lock-in demodulator (`lockin_demod`)
+correlates the bitstream with the modulation reference and accumulates
+over each modulation half-cycle; the 16-bit signed result is read over
+SPI (`spi_slave`, mode 0).
+
+- [Full design documentation](docs/info.md)
+- [Hardware setup (piezo build) and calculations](docs/hardware.md)
+
+## Register map (SPI, 3-byte transfers)
+
+| Addr | Register | Access | Description |
+|------|----------|--------|-------------|
+| 0 | `mod_period` | R/W | Modulation half-period in clock cycles (default 1000) |
+| 1 | `demod_out` | R | Demodulator output, signed 16-bit (saturating) |
+
+Command byte: bit 7 = read(1)/write(0), bit 0 = address.
+Examples: `0x00 0x03 0xE8` → set period to 1000 · `0x81 0x00 0x00` →
+read `demod_out` (MISO during bytes 2–3, MSB first).
+
+## Testing
+
+The cocotb testbench in `test/` covers reset, heartbeat, modulation
+period, SPI write/readback, lock-in accumulation and an exact numeric
+readout check (7/7 passing with Icarus Verilog + cocotb 2.0.1):
+
+```bash
+cd test
+pip install -r requirements.txt
+make
+```
+
+## Submission
+
+Shuttle TTIHP26b, 1x1 tile, top module `tt_um_gyro_lockin`.
+Submit via [app.tinytapeout.com](https://app.tinytapeout.com/projects/create).
 
 ## What is Tiny Tapeout?
 
-Tiny Tapeout is an educational project that aims to make it easier and cheaper than ever to get your digital and analog designs manufactured on a real chip.
-
-To learn more and get started, visit https://tinytapeout.com.
-
-## Set up your Verilog project
-
-1. Add your Verilog files to the `src` folder.
-2. Edit the [info.yaml](info.yaml) and update information about your project, paying special attention to the `source_files` and `top_module` properties. If you are upgrading an existing Tiny Tapeout project, check out our [online info.yaml migration tool](https://tinytapeout.github.io/tt-yaml-upgrade-tool/).
-3. Edit [docs/info.md](docs/info.md) and add a description of your project.
-4. Adapt the testbench to your design. See [test/README.md](test/README.md) for more information.
-
-The GitHub action will automatically build the ASIC files using [LibreLane](https://www.zerotoasiccourse.com/terminology/librelane/).
-
-## Enable GitHub actions to build the results page
-
-- [Enabling GitHub Pages](https://tinytapeout.com/faq/#my-github-action-is-failing-on-the-pages-part)
+Tiny Tapeout is an educational project that aims to make it easier and
+cheaper than ever to get your digital designs manufactured on a real chip.
+Learn more at https://tinytapeout.com.
 
 ## Resources
 
 - [FAQ](https://tinytapeout.com/faq/)
 - [Digital design lessons](https://tinytapeout.com/digital_design/)
-- [Learn how semiconductors work](https://tinytapeout.com/siliwiz/)
 - [Join the community](https://tinytapeout.com/discord)
-- [Build your design locally](https://www.tinytapeout.com/guides/local-hardening/)
-
-## What next?
-
-- [Submit your design to the next shuttle](https://app.tinytapeout.com/).
-- Edit [this README](README.md) and explain your design, how it works, and how to test it.
-- Share your project on your social network of choice:
-  - LinkedIn [#tinytapeout](https://www.linkedin.com/search/results/content/?keywords=%23tinytapeout) [@TinyTapeout](https://www.linkedin.com/company/100708654/)
-  - Mastodon [#tinytapeout](https://chaos.social/tags/tinytapeout) [@matthewvenn](https://chaos.social/@matthewvenn)
-  - X (formerly Twitter) [#tinytapeout](https://twitter.com/hashtag/tinytapeout) [@tinytapeout](https://twitter.com/tinytapeout)
-  - Bluesky [@tinytapeout.com](https://bsky.app/profile/tinytapeout.com)

@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
-  title:        "IFOG Lock-in Readout Core"
+  title:        "Laser Gyro Lock-in Readout Core"
   author:       "Marco Flückiger"
   discord:      ""
-  description:  "Open-loop lock-in demodulator for fiber-optic gyroscope digital readout electronics"
+  description:  "Open-loop lock-in demodulator for the digital readout electronics of a single-axis laser gyroscope (fiber-optic interferometer)"
   language:     "Verilog"
   clock_hz:     0
 
