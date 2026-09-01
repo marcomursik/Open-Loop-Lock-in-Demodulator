@@ -1,7 +1,6 @@
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, Timer
-from cocotb.result import TestFailure
 
 # ---------------------------------------------------------------------------
 # Helper: SPI transfer (Mode 0: CPOL=0, CPHA=0)
@@ -11,11 +10,23 @@ async def spi_transfer(dut, cmd_byte, data_high=0x00, data_low=0x00):
     Sendet 3 Bytes über SPI an den Slave.
     cmd_byte: Bit7=rd(1)/wr(0), Bit0=reg_addr
     Gibt bei Read die 16 empfangenen MISO-Bits zurück, sonst None.
+
+    SPI Mode 0: Der Slave legt MISO nach der fallenden SCK-Flanke um,
+    der Master sampled daher am ENDE der Low-Phase (vor der steigenden
+    Flanke). MOSI wird während der Low-Phase gewechselt.
+
+    Hinweis: uio_in wird über eine Schattenvariable geführt, weil unter
+    cocotb 2.x ein sofortiges Read-back nach einem Write noch den
+    alten (abgesetzten) Wert liefert -- Read-modify-write auf
+    dut.uio_in.value würde frühere Bitänderungen verwerfen.
     """
     sck_half_period = 500  # ns -> 1 MHz SPI bei 100ns Systemtakt
 
+    uio = 0x08  # Schattenstand: CS_N=1, SCK=0, MOSI=0
+
     # CS low
-    dut.uio_in.value = dut.uio_in.value & ~(1 << 3)
+    uio &= ~(1 << 3)
+    dut.uio_in.value = uio
     await Timer(sck_half_period * 2, units="ns")
 
     tx_bytes = [cmd_byte, data_high, data_low]
@@ -23,26 +34,27 @@ async def spi_transfer(dut, cmd_byte, data_high=0x00, data_low=0x00):
 
     for byte in tx_bytes:
         for bit in range(7, -1, -1):
-            bit_val = (byte >> bit) & 1
-            # MOSI setzen
-            uio = int(dut.uio_in.value)
-            uio = (uio & ~(1 << 1)) | (bit_val << 1)
+            # MOSI setzen (SCK ist low)
+            uio = (uio & ~(1 << 1)) | (((byte >> bit) & 1) << 1)
             dut.uio_in.value = uio
-
-            # SCK high
-            dut.uio_in.value = dut.uio_in.value | (1 << 0)
             await Timer(sck_half_period, units="ns")
 
-            # MISO samplen (kombinatorisch, also bei SCK-Rising stabil)
-            miso_val = int(dut.uio_out.value) >> 2 & 1
+            # MISO samplen: vor der steigenden SCK-Flanke (Mode 0)
+            miso_val = (int(dut.uio_out.value) >> 2) & 1
             rx_bits.append(miso_val)
 
-            # SCK low
-            dut.uio_in.value = dut.uio_in.value & ~(1 << 0)
+            # SCK high
+            uio |= (1 << 0)
+            dut.uio_in.value = uio
             await Timer(sck_half_period, units="ns")
 
+            # SCK low
+            uio &= ~(1 << 0)
+            dut.uio_in.value = uio
+
     # CS high
-    dut.uio_in.value = dut.uio_in.value | (1 << 3)
+    uio |= (1 << 3)
+    dut.uio_in.value = uio
     await Timer(sck_half_period * 2, units="ns")
 
     # Wenn Read (Bit7=1), Bytes 2+3 enthalten die 16 MISO-Bits
@@ -52,6 +64,49 @@ async def spi_transfer(dut, cmd_byte, data_high=0x00, data_low=0x00):
             rx_word = (rx_word << 1) | rx_bits[8 + i]
         return rx_word
     return None
+
+
+async def wait_rising_bit(dut, bit):
+    """
+    Wartet auf die steigende Flanke von uo_out[bit] (gepollt an der
+    fallenden Taktflanke, damit keine Read-Races mit dem RTL entstehen).
+    Ersetzt RisingEdge(dut.uo_out[bit]), das unter cocotb 2.x für
+    gepackte Vektoren nicht erlaubt ist.
+    Kehrt an der fallenden Taktflanke innerhalb des Pulses zurück.
+    """
+    prev = (int(dut.uo_out.value) >> bit) & 1
+    while True:
+        await FallingEdge(dut.clk)
+        cur = (int(dut.uo_out.value) >> bit) & 1
+        if prev == 0 and cur == 1:
+            return
+        prev = cur
+
+
+async def setup_dut(dut, ui=0x02):
+    """Gemeinsames Setup: Takt starten, Reset, Enable."""
+    clock = Clock(dut.clk, 100, units="ns")  # 10 MHz
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = ui
+    dut.uio_in.value = 0x08  # CS_N high
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 10)
+
+
+# ---------------------------------------------------------------------------
+# Fenster-Modell (wichtig für alle Demodulator-Tests)
+# ---------------------------------------------------------------------------
+# mod_ref_gen: Zähler-Wrap an Takten E0, E(P), E(2P), ... (P = Periode);
+# window_done ist jeweils im Zyklus NACH dem Wrap high.
+# lockin_demod wertet window_done am Takt ab: Demodulator-Fenster =
+# Samples E1..E(P), gelatcht an E(P+1) -- und der Latch passiert nur,
+# wenn enable=1 ist. Zum Auslesen per SPI (dauert ~25 us >> Fenster)
+# daher: einen Takt nach dem window_done-Puls enable=0 setzen, dann
+# bleibt demod_out eingefroren.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -83,28 +138,17 @@ async def test_reset(dut):
 # ---------------------------------------------------------------------------
 @cocotb.test()
 async def test_heartbeat(dut):
-    """Prüft, ob die Heartbeat-LED (~1 Hz bei 10 MHz) toggelt."""
-    clock = Clock(dut.clk, 100, units="ns")  # 10 MHz
-    cocotb.start_soon(clock.start())
+    """
+    Prüft den Heartbeat-Zähler. Ein voller Toggle dauert 5 Mio. Zyklen
+    (~0.5 s bei 10 MHz), darum wird hier nur verifiziert, dass die LED
+    nach 2000 Zyklen noch stabil ist (kein versehentliches Toggeln).
+    """
+    await setup_dut(dut)
 
-    dut.ena.value = 1
-    dut.ui_in.value = 0x02   # Enable high
-    dut.uio_in.value = 0x08  # CS_N high
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-
-    # Warte, bis LED toggelt (bei 10 MHz = 5_000_000 Zyklen für 0.5s)
-    # In Simulation: 100ns * 5_000_000 = 500ms -> zu langsam
-    # Wir prüfen nur, ob der Zähler läuft, indem wir 2000 Zyklen warten
-    # und prüfen, ob uo_out[2] sich ändert (kurze Periode für Test)
-
-    initial_led = int(dut.uo_out.value) & 0x04
+    initial_led = (int(dut.uo_out.value) >> 2) & 1
     await ClockCycles(dut.clk, 2000)
-    # LED sollte sich nicht geändert haben nach nur 2000 Zyklen
-    # (bei 10 MHz sind 2000 Zyklen = 0.2ms, Heartbeat ist ~0.5s)
-    # Aber wir prüfen, ob der Zähler läuft, indem wir Enable prüfen
-    assert dut.uo_out.value[2] == initial_led >> 2,         "Heartbeat sollte nach 2000 Zyklen noch nicht toggeln"
+    assert ((int(dut.uo_out.value) >> 2) & 1) == initial_led, \
+        "Heartbeat sollte nach 2000 Zyklen noch nicht toggeln"
     dut._log.info("Heartbeat-Test bestanden (Zähler läuft)")
 
 
@@ -114,32 +158,24 @@ async def test_heartbeat(dut):
 @cocotb.test()
 async def test_modulation_period(dut):
     """Prüft, ob die Modulationsreferenz mit der per SPI gesetzten Periode toggelt."""
-    clock = Clock(dut.clk, 100, units="ns")
-    cocotb.start_soon(clock.start())
-
-    dut.ena.value = 1
-    dut.ui_in.value = 0x02   # Enable high
-    dut.uio_in.value = 0x08  # CS_N high
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 10)
+    await setup_dut(dut)
 
     # Setze Modulationsperiode auf 20 über SPI (Write Reg 0)
     await spi_transfer(dut, cmd_byte=0x00, data_high=0x00, data_low=0x14)
     await ClockCycles(dut.clk, 5)
 
-    # Warte auf ersten window_done-Puls und messe Periode
-    await RisingEdge(dut.uo_out[1])  # window_done
+    # Warte auf window_done-Pulse und messe deren Abstand
+    await wait_rising_bit(dut, 1)
     start_time = cocotb.utils.get_sim_time("ns")
 
-    await RisingEdge(dut.uo_out[1])  # nächster window_done
+    await wait_rising_bit(dut, 1)
     end_time = cocotb.utils.get_sim_time("ns")
 
     period_ns = end_time - start_time
-    expected_ns = 20 * 100  # 20 Zyklen * 100ns
+    expected_ns = 20 * 100  # 20 Zyklen * 100 ns
 
-    assert abs(period_ns - expected_ns) < 200,         f"Modulationsperiode falsch: {period_ns}ns, erwartet ~{expected_ns}ns"
+    assert abs(period_ns - expected_ns) <= 200, \
+        f"Modulationsperiode falsch: {period_ns}ns, erwartet ~{expected_ns}ns"
 
     dut._log.info(f"Modulationsperiode korrekt: {period_ns}ns (erwartet {expected_ns}ns)")
 
@@ -150,16 +186,7 @@ async def test_modulation_period(dut):
 @cocotb.test()
 async def test_spi_write_read(dut):
     """Schreibt einen Wert in Reg 0 und liest ihn zurück."""
-    clock = Clock(dut.clk, 100, units="ns")
-    cocotb.start_soon(clock.start())
-
-    dut.ena.value = 1
-    dut.ui_in.value = 0x02
-    dut.uio_in.value = 0x08
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 10)
+    await setup_dut(dut)
 
     # Schreibe 0xABCD in Reg 0
     await spi_transfer(dut, cmd_byte=0x00, data_high=0xAB, data_low=0xCD)
@@ -173,63 +200,42 @@ async def test_spi_write_read(dut):
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Lock-in Demodulator mit simuliertem Delta-Sigma
+# Test 5: Lock-in Demodulator mit simuliertem Delta-Sigma (Smoke-Test)
 # ---------------------------------------------------------------------------
 @cocotb.test()
 async def test_lockin_demod(dut):
     """
-    Füttert einen konstanten Delta-Sigma-Stream (immer 1) in den Demodulator.
-    Da ref_sign toggelt, sollte die Korrelation über eine Periode ~0 ergeben
-    (gleich viele +1 und -1). Wir erzwingen aber eine Asymmetrie.
+    Füttert konstant ds_bit = 1 in den Demodulator. Da ref_sign innerhalb
+    eines Fensters konstant ist, muss jede volle Fenster-Akkumulation
+    exakt +/-Periode ergeben (Vollausschlag, Vorzeichen je nach Phase).
     """
-    clock = Clock(dut.clk, 100, units="ns")
-    cocotb.start_soon(clock.start())
-
-    dut.ena.value = 1
-    dut.ui_in.value = 0x02   # Enable high
-    dut.uio_in.value = 0x08  # CS_N high
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 10)
+    await setup_dut(dut)
 
     # Setze kurze Periode für schnellen Test
     await spi_transfer(dut, cmd_byte=0x00, data_high=0x00, data_low=0x10)  # Periode = 16
-    await ClockCycles(dut.clk, 5)
 
-    # Warte auf ersten window_done, um synchron zu sein
-    await RisingEdge(dut.uo_out[1])
+    # ds_bit = 1 konstant anlegen, BEVOR das Referenzfenster startet
+    dut.ui_in.value = 0x03  # enable=1, ds_bit=1
 
-    # Füttere ds_bit = 1 für die erste Hälfte der Periode (ref_sign = 0)
-    # und ds_bit = 0 für die zweite Hälfte (ref_sign = 1)
-    # Das ergibt: ref=0, ds=1 -> corr=-1 für 8 Zyklen
-    #             ref=1, ds=0 -> corr=-1 für 8 Zyklen
-    # Gesamt: -16 -> nach >>> 8 = 0xFF00 (signed -256)
+    # Zwei Fenstergrenzen abwarten -> dazwischen liegt ein volles
+    # Fenster mit ds_bit = 1
+    await wait_rising_bit(dut, 1)
+    await wait_rising_bit(dut, 1)
+    await ClockCycles(dut.clk, 1)  # Latch-Takt (E(P+1)) mit enable=1 durchlassen
 
-    for _ in range(8):
-        dut.ui_in.value = 0x03  # enable=1, ds_bit=1
-        await ClockCycles(dut.clk, 1)
-
-    for _ in range(8):
-        dut.ui_in.value = 0x02  # enable=1, ds_bit=0
-        await ClockCycles(dut.clk, 1)
-
-    # Warte auf window_done (sollte jetzt kommen)
-    await RisingEdge(dut.uo_out[1])
-    await ClockCycles(dut.clk, 2)  # Pipeline-Verzögerung
+    # Demodulator einfrieren: bei enable=0 haelt demod_out seinen Wert,
+    # sonst laeuft waehrend der SPI-Uebertragung (~25 us) schon das
+    # naechste Fenster ueber und das Register aendert sich unterwegs.
+    dut.ui_in.value = 0x00
+    await ClockCycles(dut.clk, 2)
 
     # Lese demod_out aus Reg 1
     rx_data = await spi_transfer(dut, cmd_byte=0x81, data_high=0x00, data_low=0x00)
+    signed_val = rx_data if rx_data < 32768 else rx_data - 65536
+    dut._log.info(f"Demodulator-Output: 0x{rx_data:04X} (signed: {signed_val})")
 
-    # Erwartung: -16 akkumuliert, >>> 8 = 0xFFF0 (signed -16 in 16-bit?)
-    # Warte, die Korrelation ist +/-1, 16 Zyklen -> Akku = -16
-    # >>> 8 von -16 (als 24-bit: 0xFFFFF0) = 0xFFFF (als 16-bit signed = -1)
-    # Hmm, das Skalieren ist ein Platzhalter. Wir prüfen nur, ob ein Wert da ist.
-
-    dut._log.info(f"Demodulator-Output: 0x{rx_data:04X} (signed: {rx_data if rx_data < 32768 else rx_data - 65536})")
-
-    # Nur prüfen, dass der Wert nicht 0 ist (es wurde etwas akkumuliert)
-    assert rx_data != 0x0000, "Demodulator-Output sollte nach Akkumulation nicht 0 sein"
+    assert abs(signed_val) == 16, \
+        f"|demod_out| sollte 16 (= Periode, Vollausschlag) sein, war {signed_val}"
     dut._log.info("Lock-in Demodulator-Test bestanden")
 
 
@@ -242,47 +248,93 @@ async def test_spi_full_readout(dut):
     Vollständiger Test: Setze Periode, füttere Delta-Sigma, warte auf
     window_done, lese Ergebnis per SPI.
     """
-    clock = Clock(dut.clk, 100, units="ns")
-    cocotb.start_soon(clock.start())
-
-    dut.ena.value = 1
-    dut.ui_in.value = 0x02
-    dut.uio_in.value = 0x08
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 10)
+    await setup_dut(dut)
 
     # Periode = 32
     await spi_transfer(dut, cmd_byte=0x00, data_high=0x00, data_low=0x20)
-    await ClockCycles(dut.clk, 5)
 
-    # Warte auf Synchronisation
-    await RisingEdge(dut.uo_out[1])
+    # Warte auf Fenstergrenze (Rückkehr: fallende Flanke F0 im Puls)
+    await wait_rising_bit(dut, 1)
+    ref_new = int(dut.uo_out.value) & 1
 
-    # Erzeuge ein Muster: ds_bit = ref_sign für 16 Zyklen, dann ds_bit != ref_sign
-    # Das ergibt eine klare Asymmetrie
-    for i in range(32):
-        ref = int(dut.uo_out.value[0])
-        if i < 24:
-            ds = ref  # gleich -> corr = +1
-        else:
-            ds = 1 - ref  # ungleich -> corr = -1
-        dut.ui_in.value = 0x02 | (ds << 0)
-        await ClockCycles(dut.clk, 1)
+    # Erzeuge ein Muster: ds_bit = ref_sign für 24 Zyklen, dann ds_bit != ref_sign.
+    # Samples E2..E32 (31 Stück, gesteuert); Sample E1 läuft noch mit ds=0.
+    for i in range(31):
+        await FallingEdge(dut.clk)
+        ref = int(dut.uo_out.value) & 1
+        ds = ref if i < 24 else (1 - ref)
+        dut.ui_in.value = 0x02 | ds
 
-    # Warte auf nächsten window_done
-    await RisingEdge(dut.uo_out[1])
+    # Fenster W = E1..E32: E1 mit ds=0 -> corr = +1 gdw. ref_new==0;
+    # E2..E25: 24x Match, E26..E32: 7x Mismatch -> +17
+    expected = 17 + (1 if ref_new == 0 else -1)
+
+    # Warte auf Fensterende-Puls, dann Latch-Takt abwarten und einfrieren
+    await wait_rising_bit(dut, 1)
+    await ClockCycles(dut.clk, 1)  # Latch-Takt mit enable=1 durchlassen
+    dut.ui_in.value = 0x00
     await ClockCycles(dut.clk, 3)
 
     # Lese Reg 1 (demod_out)
     rx_data = await spi_transfer(dut, cmd_byte=0x81, data_high=0x00, data_low=0x00)
 
     signed_val = rx_data if rx_data < 32768 else rx_data - 65536
-    dut._log.info(f"SPI Readout: 0x{rx_data:04X} = {signed_val} (signed)")
+    dut._log.info(f"SPI Readout: 0x{rx_data:04X} = {signed_val} (signed), erwartet {expected}")
 
-    # Erwartung: 24 * (+1) + 8 * (-1) = +16 -> nach >>> 8 = 0 (zu klein)
-    # Bei Periode 32 und >>> 8 ist das Ergebnis sehr klein.
-    # Wir prüfen nur, dass SPI funktioniert und ein definierter Wert zurückkommt.
-    assert rx_data is not None, "SPI Readout fehlgeschlagen"
+    assert signed_val == expected, \
+        f"demod_out = {signed_val}, erwartet {expected}"
     dut._log.info("SPI Full-Readout-Test bestanden")
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Numerischer Readout-Test (Erwartwert exakt mitverfolgt)
+# ---------------------------------------------------------------------------
+@cocotb.test()
+async def test_spi_numeric_readout(dut):
+    """
+    Numerischer Test: demod_out muss exakt dem berechneten Erwartwert
+    entsprechen.
+
+    Fenster W = E1..E32 (Periode 32, siehe Fenster-Modell oben).
+    Alle 32 Samples werden gesteuert: 24x ds == ref (corr = +1),
+    8x ds != ref (corr = -1) -> Erwartwert = 24 - 8 = +16.
+    """
+    await setup_dut(dut, ui=0x02)
+
+    # Periode = 32 Takte
+    await spi_transfer(dut, cmd_byte=0x00, data_high=0x00, data_low=0x20)
+
+    # Warte auf Fenstergrenze (Rückkehr: fallende Flanke F0 im Puls-Zyklus)
+    await wait_rising_bit(dut, 1)
+    ref_new = int(dut.uo_out.value) & 1
+
+    # Samples E1..E31: 24x Match, 7x Mismatch. Sample E32 übernimmt den
+    # letzten gesetzten Wert (Mismatch) -> insgesamt 24 - 8 = +16.
+    expected = 0
+    for i in range(31):
+        ref = int(dut.uo_out.value) & 1
+        assert ref == ref_new, "ref_sign hat innerhalb des Fensters gewechselt"
+        ds = ref if i < 24 else (1 - ref)
+        dut.ui_in.value = 0x02 | ds
+        expected += 1 if ds == ref else -1
+        await RisingEdge(dut.clk)       # Sample-Edge E(i+1)
+        if i < 30:
+            await FallingEdge(dut.clk)  # zurück zur Mitte des Zyklus
+    expected -= 1  # Sample E32: ds vom letzten Loop-Durchlauf (Mismatch)
+
+    # Fensterende-Puls abwarten, Latch-Takt E33 mit enable=1 durchlassen,
+    # dann einfrieren (enable=0 haelt demod_out), damit sich das Register
+    # waehrend der ~25 us langen SPI-Uebertragung nicht mehr aendert.
+    await wait_rising_bit(dut, 1)
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0x00
+    await ClockCycles(dut.clk, 3)
+
+    rx_data = await spi_transfer(dut, cmd_byte=0x81, data_high=0x00, data_low=0x00)
+    rx_signed = rx_data if rx_data < 32768 else rx_data - 65536
+    dut._log.info(f"Numerischer Readout: {rx_signed} (erwartet {expected})")
+
+    assert rx_signed == expected, \
+        f"demod_out = {rx_signed}, erwartet {expected}"
+    assert expected == 16, "Testdesign-Fehler: Erwartwert muss 16 sein"
+    dut._log.info("Numerischer Readout-Test bestanden")
