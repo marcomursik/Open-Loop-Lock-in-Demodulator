@@ -60,19 +60,24 @@ module spi_slave (
                 end
 
                 if (bit_cnt == 5'd7) begin
-                    rd_flag  <= rx_sr[7];
-                    reg_addr <= rx_sr[0];
-                    if (rx_sr[7]) begin
-                        tx_sr <= (rx_sr[0] == 0) ? reg_rdata_0 : reg_rdata_1;
+                    // Nonblocking semantics: at the 8th SCK edge rx_sr holds
+                    // only the first 7 command bits (cmd[7:1] in rx_sr[6:0]),
+                    // the last command bit (cmd[0]) is still on the mosi pin.
+                    rd_flag  <= rx_sr[6];   // cmd[7]: 1 = read, 0 = write
+                    reg_addr <= mosi;       // cmd[0]: register address
+                    if (rx_sr[6]) begin
+                        tx_sr <= mosi ? reg_rdata_1 : reg_rdata_0;
                     end
                 end else if (bit_cnt == 5'd15) begin
+                    // rx_sr is a left-shifting register: at each byte boundary
+                    // the last 8 stream bits are in {rx_sr[6:0], mosi}.
                     if (!rd_flag) begin
-                        reg_wdata[15:8] <= {rx_sr[14:8], mosi};
+                        reg_wdata[15:8] <= {rx_sr[6:0], mosi};  // data-high byte
                     end
                 end else if (bit_cnt == 5'd23) begin
                     bit_cnt <= 0;
                     if (!rd_flag) begin
-                        reg_wdata[7:0] <= {rx_sr[22:16], mosi};
+                        reg_wdata[7:0] <= {rx_sr[6:0], mosi};   // data-low byte
                         reg_wr <= 1;
                     end
                     rd_flag <= 0;

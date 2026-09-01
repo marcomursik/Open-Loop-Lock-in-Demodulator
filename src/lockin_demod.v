@@ -25,7 +25,16 @@ module lockin_demod #(
             valid     <= 0;
         end else if (enable) begin
             if (window_done) begin
-                demod_out <= acc >>> 8;  // Placeholder scaling
+                // Scaling: |acc| <= period <= 2^16-1, so acc fits in 17 bits
+                // (signed). demod_out is 16-bit signed, therefore periods up to
+                // 32767 cycles are transferred losslessly; above that the
+                // result is saturated instead of wrapping around.
+                if (acc > 24'sd32767)
+                    demod_out <= 16'sh7FFF;
+                else if (acc < -24'sd32768)
+                    demod_out <= -16'sh8000;
+                else
+                    demod_out <= acc[15:0];
                 acc       <= corr;
                 valid     <= 1'b1;
             end else begin
